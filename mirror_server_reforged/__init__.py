@@ -78,12 +78,13 @@ STOP_WAIT_INTERVAL = 1
 START_WAIT_TIMEOUT = 300
 # The interval (in second) between two mirror server startup checks
 START_WAIT_INTERVAL = 2
-# A launcher script (e.g. a start.bat running `start java ...`) starts the real server as
-# a separate process and exits itself, so the process handle we hold dying does NOT mean
-# the startup failed. After the handle exits we keep waiting, and only report a failed
-# start once the mirror server has shown no sign of life for this many seconds
-START_EXIT_GRACE = 30
-# How recent a write to the mirror server's log counts as a sign of life, in second
+# A launcher that is "fire and forget" (e.g. `open -a Terminal start.command`, a
+# start.bat doing `start java ...`, or `nohup ... &`) starts the real server elsewhere
+# and exits immediately, so the process handle we hold dying does NOT mean the startup
+# failed. After the handle exits we keep waiting, and only report a failed start once
+# the mirror server has shown no sign of life for this many seconds
+START_EXIT_GRACE = 90
+# How recent a write to any mirror server log counts as a sign of life, in second
 MIRROR_ALIVE_LOG_WINDOW = 15
 
 # The result of WaitForMirrorStart
@@ -379,43 +380,66 @@ def ReadMirrorServerHost():
     return ReadMirrorServerProperties().get("server-ip", "").strip() or "127.0.0.1"
 
 
-def GetMirrorLogPaths():
-    """Candidate paths of the mirror server's console log, most likely first."""
-    candidates = []
+def GetMirrorLogDirectories():
+    """Candidate directories holding the mirror server's logs, most likely first.
+
+    Covered layouts:
+
+    - a plain server: ``<dir of server.properties>/logs`` (``latest.log``)
+    - a MCDR instance: ``<dir of server.properties>/logs`` for the inner server, plus
+      ``<parent>/logs`` for the MCDR instance itself (``MCDR.log``)
+
+    Any ``*.log`` inside these directories counts, so both the inner server's
+    ``latest.log`` and the MCDR instance's own log are picked up without having to
+    hard-code file names.
+
+    The MCDR root directory itself is deliberately never included: it holds the main
+    server's logs, which are always being written and would make the mirror server
+    look permanently alive.
+    """
+    directories = []
     properties_path = FindMirrorServerProperties()
     if properties_path is not None:
-        candidates.append(
-            os.path.join(os.path.dirname(properties_path), "logs", "latest.log")
-        )
+        directories.append(os.path.join(os.path.dirname(properties_path), "logs"))
     target = config.get("target")
     if target:
-        candidates.append(os.path.join(ToAbsolutePath(target), "logs", "latest.log"))
-    # MCDR mode keeps the inner server one level deeper than the mirrored worlds
-    candidates.append(os.path.normpath(os.path.join(path, "Mirror", "logs", "latest.log")))
-    candidates.append(
-        os.path.normpath(os.path.join(path, "Mirror", "server", "logs", "latest.log"))
-    )
+        target_absolute = ToAbsolutePath(target)
+        directories.append(os.path.join(target_absolute, "logs"))
+        # the parent of the mirrored server directory is the mirror MCDR instance root,
+        # unless it is the MCDR root itself (a plain server mirrored straight into
+        # ./Mirror would otherwise pull in the main server's logs)
+        parent = os.path.dirname(target_absolute)
+        if parent and os.path.normpath(parent) != os.path.normpath(path):
+            directories.append(os.path.join(parent, "logs"))
+    directories.append(os.path.normpath(os.path.join(path, "Mirror", "logs")))
     unique = []
-    for candidate in candidates:
-        if candidate not in unique:
-            unique.append(candidate)
+    for directory in directories:
+        if directory not in unique:
+            unique.append(directory)
     return unique
 
 
 def IsMirrorLogActive(window=MIRROR_ALIVE_LOG_WINDOW):
-    """Check if the mirror server has written to its log file recently.
+    """Check if the mirror server, or its MCDR instance, wrote a log recently.
 
     A server that is still starting up keeps writing to its log (mod loading, world
     generation, ...), while a launch that never produced a server writes nothing.
     """
     newest = None
-    for log_path in GetMirrorLogPaths():
+    for log_dir in GetMirrorLogDirectories():
         try:
-            mtime = os.path.getmtime(log_path)
+            names = os.listdir(log_dir)
         except OSError:
             continue
-        if newest is None or mtime > newest:
-            newest = mtime
+        for name in names:
+            if not name.endswith(".log"):
+                continue
+            try:
+                mtime = os.path.getmtime(os.path.join(log_dir, name))
+            except OSError:
+                continue
+            if newest is None or mtime > newest:
+                newest = mtime
     return newest is not None and (time.time() - newest) <= window
 
 
@@ -490,11 +514,18 @@ def WaitForMirrorStart(process, timeout=None):
                 return MIRROR_START_READY
         if process is not None and process.poll() is not None:
             now = time.monotonic()
-            if exited_at is None:
+            first_check = exited_at is None
+            if first_check:
                 exited_at = now
-            if IsMirrorAlive():
-                # a launcher handed the server off to another process, or the server is
-                # still starting up, so the handle exiting does not mean a failure
+            alive = IsMirrorAlive()
+            exit_code = getattr(process, "returncode", None)
+            if first_check and exit_code not in (0, None) and not alive:
+                # a non-zero exit code with no sign of life means the launch itself
+                # failed (command not found, permission denied, ...): a reliable signal
+                return MIRROR_START_EXITED
+            if alive:
+                # a fire-and-forget launcher handed the server off to another process,
+                # or the server is still starting up: keep waiting instead of failing
                 last_alive_at = now
             else:
                 # only give up after the mirror server showed no sign of life at all

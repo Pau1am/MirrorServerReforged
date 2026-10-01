@@ -73,12 +73,15 @@ problems): the Minecraft Server List Ping of the mirror server, plus its Rcon po
 Rcon is enabled. Plain "the game port accepts a TCP connection" is deliberately not used,
 because a server binds that port early during startup, long before it is ready.
 
-If you launch the mirror through a script such as `start.bat` (which runs `start java ...`
-and then exits), the process the plugin holds exits early. That is a normal hand-off: the
-plugin then relies on the mirror server's own activity (its log file being written, its
-ports being open) and will **not** report a failed start. A failed start is only reported
-when the launch has ended and no sign of the mirror server shows up afterwards; if it is
-still not ready after 300 seconds, the plugin tells you to check it manually.
+If you launch the mirror through a script, or by opening a terminal window (Windows
+`start.bat` doing `start java ...`, or macOS `open -a Terminal start_mirror.command` /
+`osascript`), the process the plugin holds usually exits before the mirror server is up.
+That is a normal hand-off: the plugin then relies on the mirror server's own activity (its
+log file being written, its ports being open) and will **not** report a failed start. A
+failed start is reported once the launch has ended and no sign of the mirror server shows
+up for 90 seconds; if the launch ends with a non-zero exit code (command not found, no
+permission, ...) it is reported immediately. If the mirror is still not ready after 300
+seconds, the plugin tells you to check it manually.
 
 After `!!msr stop`, the plugin first replies with an acknowledgement, and then sends a
 completion notice to the command source once the mirror server has **fully stopped**,
