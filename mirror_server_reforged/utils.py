@@ -8,6 +8,8 @@ import os
 import socket
 import struct
 
+import javaproperties
+
 from mcdreforged.api.utils import Serializable
 
 
@@ -84,18 +86,13 @@ def ReadServerProperties(properties_path):
     if properties_path is None:
         return MirrorServerProperties.get_default()
     try:
-        with open(properties_path, "r", encoding="utf-8", errors="replace") as file:
-            lines = file.readlines()
-    except OSError:
+        # utf-8-sig drops a BOM, which would otherwise end up glued to the first key
+        with open(properties_path, "r", encoding="utf-8-sig", errors="replace") as file:
+            parsed = javaproperties.load(file)
+    except (OSError, UnicodeDecodeError):
         return MirrorServerProperties.get_default()
-    raw = {}
-    for line in lines:
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        # server-port -> server_port, so the keys map onto the field names
-        raw[key.strip().replace("-", "_")] = value.strip()
+    # server-port -> server_port, so the keys map onto the field names
+    raw = {key.replace("-", "_"): value for key, value in parsed.items()}
     return MirrorServerProperties.deserialize(raw)
 
 
