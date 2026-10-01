@@ -78,10 +78,17 @@ STOP_WAIT_INTERVAL = 1
 START_WAIT_TIMEOUT = 300
 # The interval (in second) between two mirror server startup checks
 START_WAIT_INTERVAL = 2
+# A launcher script (e.g. a start.bat running `start java ...`) starts the real server as
+# a separate process and exits itself, so the process handle we hold dying does NOT mean
+# the startup failed. After the handle exits we keep waiting, and only report a failed
+# start once the mirror server has shown no sign of life for this many seconds
+START_EXIT_GRACE = 30
+# How recent a write to the mirror server's log counts as a sign of life, in second
+MIRROR_ALIVE_LOG_WINDOW = 15
 
 # The result of WaitForMirrorStart
 MIRROR_START_READY = "ready"  # the mirror server finished starting up
-MIRROR_START_EXITED = "exited"  # the mirror server process died before it was ready
+MIRROR_START_EXITED = "exited"  # the launch ended without the mirror server ever coming up
 MIRROR_START_TIMEOUT = "timeout"  # still not ready when the wait timed out
 MIRROR_START_UNKNOWN = "unknown"  # no usable readiness probe is available
 
@@ -327,6 +334,28 @@ def FindMirrorServerProperties():
     return None
 
 
+def ReadMirrorServerProperties():
+    """Parse the mirror server's server.properties into a dict.
+
+    Returns an empty dict when no server.properties can be found.
+    """
+    properties_path = FindMirrorServerProperties()
+    if properties_path is None:
+        return {}
+    properties = {}
+    try:
+        with open(properties_path, "r", encoding="utf-8", errors="replace") as file:
+            for line in file:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                properties[key.strip()] = value.strip()
+    except Exception:
+        return {}
+    return properties
+
+
 def ReadMirrorServerPort():
     """Read server-port from the mirror server's server.properties.
 
@@ -334,18 +363,77 @@ def ReadMirrorServerPort():
     guessed: the main server usually listens on 25565, so probing a guessed port
     could mistake the main server for the mirror server.
     """
-    properties_path = FindMirrorServerProperties()
-    if properties_path is None:
-        return None
     try:
-        with open(properties_path, "r", encoding="utf-8", errors="replace") as file:
-            for line in file:
-                line = line.strip()
-                if line.startswith("server-port="):
-                    return int(line.split("=", 1)[1].strip())
-    except Exception:
+        return int(ReadMirrorServerProperties()["server-port"])
+    except (KeyError, ValueError):
         return None
-    return None
+
+
+def ReadMirrorServerHost():
+    """Read server-ip from the mirror server's server.properties.
+
+    A mirror server configured with a fixed server-ip does not listen on the loopback
+    address, so the configured address has to be used for probing. Falls back to the
+    loopback address when server-ip is not set.
+    """
+    return ReadMirrorServerProperties().get("server-ip", "").strip() or "127.0.0.1"
+
+
+def GetMirrorLogPaths():
+    """Candidate paths of the mirror server's console log, most likely first."""
+    candidates = []
+    properties_path = FindMirrorServerProperties()
+    if properties_path is not None:
+        candidates.append(
+            os.path.join(os.path.dirname(properties_path), "logs", "latest.log")
+        )
+    target = config.get("target")
+    if target:
+        candidates.append(os.path.join(ToAbsolutePath(target), "logs", "latest.log"))
+    # MCDR mode keeps the inner server one level deeper than the mirrored worlds
+    candidates.append(os.path.normpath(os.path.join(path, "Mirror", "logs", "latest.log")))
+    candidates.append(
+        os.path.normpath(os.path.join(path, "Mirror", "server", "logs", "latest.log"))
+    )
+    unique = []
+    for candidate in candidates:
+        if candidate not in unique:
+            unique.append(candidate)
+    return unique
+
+
+def IsMirrorLogActive(window=MIRROR_ALIVE_LOG_WINDOW):
+    """Check if the mirror server has written to its log file recently.
+
+    A server that is still starting up keeps writing to its log (mod loading, world
+    generation, ...), while a launch that never produced a server writes nothing.
+    """
+    newest = None
+    for log_path in GetMirrorLogPaths():
+        try:
+            mtime = os.path.getmtime(log_path)
+        except OSError:
+            continue
+        if newest is None or mtime > newest:
+            newest = mtime
+    return newest is not None and (time.time() - newest) <= window
+
+
+def IsMirrorAlive():
+    """Best-effort check whether the mirror server is running, or still starting up.
+
+    Used to tell a mirror server that a launcher handed off to another process apart
+    from a launch that never produced a server at all.
+    """
+    if IsMirrorLogActive():
+        return True
+    port = ReadMirrorServerPort()
+    if port is not None and IsTcpPortOpen(ReadMirrorServerHost(), port):
+        return True
+    if config["rcon"]["enable"]:
+        if IsRconPortOpen(config["rcon"]["host"], config["rcon"]["port"]):
+            return True
+    return False
 
 
 def GetMirrorReadyProbes():
@@ -357,12 +445,28 @@ def GetMirrorReadyProbes():
     probes = []
     port = ReadMirrorServerPort()
     if port is not None:
-        probes.append(lambda: IsMinecraftServerReady("127.0.0.1", port))
+        host = ReadMirrorServerHost()
+        probes.append(lambda: IsMinecraftServerReady(host, port))
     if config["rcon"]["enable"]:
         rcon_host = config["rcon"]["host"]
         rcon_port = config["rcon"]["port"]
         probes.append(lambda: IsRconPortOpen(rcon_host, rcon_port))
     return probes
+
+
+def DescribeMirrorReadyProbes():
+    """Describe the probes in use, to help diagnose a startup that is not detected."""
+    parts = []
+    port = ReadMirrorServerPort()
+    if port is not None:
+        parts.append("状态查询 {}:{}".format(ReadMirrorServerHost(), port))
+    else:
+        parts.append("状态查询不可用（未读到 server-port）")
+    if config["rcon"]["enable"]:
+        parts.append("Rcon {}:{}".format(config["rcon"]["host"], config["rcon"]["port"]))
+    else:
+        parts.append("Rcon 未开启")
+    return "，".join(parts)
 
 
 def WaitForMirrorStart(process, timeout=None):
@@ -378,32 +482,48 @@ def WaitForMirrorStart(process, timeout=None):
     if len(probes) == 0:
         return MIRROR_START_UNKNOWN
     deadline = time.monotonic() + timeout
+    exited_at = None
+    last_alive_at = None
     while time.monotonic() < deadline:
-        if process is not None and process.poll() is not None:
-            return MIRROR_START_EXITED
         for probe in probes:
             if probe():
                 return MIRROR_START_READY
+        if process is not None and process.poll() is not None:
+            now = time.monotonic()
+            if exited_at is None:
+                exited_at = now
+            if IsMirrorAlive():
+                # a launcher handed the server off to another process, or the server is
+                # still starting up, so the handle exiting does not mean a failure
+                last_alive_at = now
+            else:
+                # only give up after the mirror server showed no sign of life at all
+                reference = exited_at if last_alive_at is None else max(exited_at, last_alive_at)
+                if now - reference >= START_EXIT_GRACE:
+                    return MIRROR_START_EXITED
         time.sleep(START_WAIT_INTERVAL)
     return MIRROR_START_TIMEOUT
 
 
 def NotifyMirrorStart(InterFace, process):
     """Wait for the mirror server to come up, then tell the players about the result."""
+    InterFace.logger.info(
+        "[MirrorServerReforged] 启动检测方式：{}".format(DescribeMirrorReadyProbes())
+    )
     result = WaitForMirrorStart(process)
     if result == MIRROR_START_READY:
         Broadcast(InterFace, "镜像服已启动完成，现在可以转服了！")
     elif result == MIRROR_START_EXITED:
         Broadcast(
             InterFace,
-            "镜像服启动失败！进程已退出，请查看镜像服控制台的报错信息。",
+            "镜像服启动失败！启动进程已退出，且未检测到镜像服运行，请查看镜像服控制台的报错信息。",
             RColor.red,
         )
     elif result == MIRROR_START_TIMEOUT:
         Broadcast(
             InterFace,
-            "已启动镜像服，但等待{}秒后仍未检测到启动完成，请手动检查！".format(
-                START_WAIT_TIMEOUT
+            "已启动镜像服，但等待{}秒后仍未检测到启动完成，请手动检查！（检测方式：{}）".format(
+                START_WAIT_TIMEOUT, DescribeMirrorReadyProbes()
             ),
             RColor.red,
         )
@@ -477,13 +597,18 @@ def GetInterFace(*args):
 #         server.reply('§b[MirrorServerReforged] §6镜像服未运行……')
 
 
-def IsRconPortOpen(host, port, timeout=1):
-    """Check if the RCON port of the mirror server still accepts connections."""
+def IsTcpPortOpen(host, port, timeout=1):
+    """Check if a TCP connection can be established to the given address."""
     try:
         with socket.create_connection((host, port), timeout):
             return True
     except OSError:
         return False
+
+
+def IsRconPortOpen(host, port, timeout=1):
+    """Check if the RCON port of the mirror server accepts connections."""
+    return IsTcpPortOpen(host, port, timeout)
 
 
 def GetMirrorProcess():

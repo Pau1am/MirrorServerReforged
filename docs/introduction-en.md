@@ -66,9 +66,19 @@ Now, I'll introduce the content of the config file:
 
 After `!!msr start`, the plugin broadcasts a notice once the mirror server has
 **finished starting up**, so players are told when they can transfer instead of having to
-guess or watch the mirror server console themselves. If the mirror server process exits
-before it is ready, a failed start is reported instead; if it is still not ready after
-300 seconds, the plugin tells you to check it manually.
+guess or watch the mirror server console themselves.
+
+How readiness is detected (printed to the MCDR console on startup, to help diagnose
+problems): the Minecraft Server List Ping of the mirror server, plus its Rcon port when
+Rcon is enabled. Plain "the game port accepts a TCP connection" is deliberately not used,
+because a server binds that port early during startup, long before it is ready.
+
+If you launch the mirror through a script such as `start.bat` (which runs `start java ...`
+and then exits), the process the plugin holds exits early. That is a normal hand-off: the
+plugin then relies on the mirror server's own activity (its log file being written, its
+ports being open) and will **not** report a failed start. A failed start is only reported
+when the launch has ended and no sign of the mirror server shows up afterwards; if it is
+still not ready after 300 seconds, the plugin tells you to check it manually.
 
 After `!!msr stop`, the plugin first replies with an acknowledgement, and then sends a
 completion notice to the command source once the mirror server has **fully stopped**,
