@@ -64,6 +64,12 @@ Now, I'll introduce the content of the config file:
 !!msr status - Checkout the status of your mirror server
 ```
 
+After `!!msr start`, the plugin broadcasts a notice once the mirror server has
+**finished starting up**, so players are told when they can transfer instead of having to
+guess or watch the mirror server console themselves. If the mirror server process exits
+before it is ready, a failed start is reported instead; if it is still not ready after
+300 seconds, the plugin tells you to check it manually.
+
 After `!!msr stop`, the plugin first replies with an acknowledgement, and then sends a
 completion notice to the command source once the mirror server has **fully stopped**,
 so you can always tell whether the mirror server is really down. If the mirror server is

@@ -3,6 +3,7 @@ import json
 import os
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -72,6 +73,17 @@ syncFlag = False
 STOP_WAIT_TIMEOUT = 120
 # The interval (in second) between two mirror server shutdown checks
 STOP_WAIT_INTERVAL = 1
+# The longest time (in second) to wait for the mirror server to finish starting up
+# before telling the players that the startup result is unknown
+START_WAIT_TIMEOUT = 300
+# The interval (in second) between two mirror server startup checks
+START_WAIT_INTERVAL = 2
+
+# The result of WaitForMirrorStart
+MIRROR_START_READY = "ready"  # the mirror server finished starting up
+MIRROR_START_EXITED = "exited"  # the mirror server process died before it was ready
+MIRROR_START_TIMEOUT = "timeout"  # still not ready when the wait timed out
+MIRROR_START_UNKNOWN = "unknown"  # no usable readiness probe is available
 
 
 def InitalizeOnFirstRun():
@@ -215,10 +227,199 @@ def Sync():
         ServerSync(InterFace)
 
 
+def EncodeVarInt(value):
+    """Encode an integer as a Minecraft protocol VarInt."""
+    data = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        if value:
+            data.append(byte | 0x80)
+        else:
+            data.append(byte)
+            return bytes(data)
+
+
+def DecodeVarInt(sock):
+    """Read a Minecraft protocol VarInt from a socket."""
+    value = 0
+    shift = 0
+    while True:
+        chunk = sock.recv(1)
+        if not chunk:
+            raise OSError("连接已被对端关闭")
+        byte = chunk[0]
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value
+        shift += 7
+        if shift > 35:
+            raise OSError("VarInt 过长")
+
+
+# The protocol version sent in the handshake packet of a Server List Ping.
+# The mirror server answers the status request regardless of the version that is
+# sent, as long as it is a valid VarInt, so the exact value does not matter here
+MINECRAFT_PROTOCOL_VERSION = 767
+
+
+def IsMinecraftServerReady(host, port, timeout=2):
+    """Check if the Minecraft server on the given port finished starting up.
+
+    A plain TCP connection is not enough: a Minecraft server binds its game port
+    early during startup, so the port already accepts connections while the world
+    is still loading. The server only answers a Server List Ping once it is ready
+    for players, which is what makes the ping a reliable readiness signal.
+    """
+    try:
+        with socket.create_connection((host, port), timeout) as connection:
+            connection.settimeout(timeout)
+            host_bytes = host.encode("utf-8")
+            handshake = (
+                b"\x00"
+                + EncodeVarInt(MINECRAFT_PROTOCOL_VERSION)
+                + EncodeVarInt(len(host_bytes))
+                + host_bytes
+                + struct.pack(">H", port)
+                + b"\x01"
+            )
+            connection.sendall(EncodeVarInt(len(handshake)) + handshake)
+            connection.sendall(EncodeVarInt(1) + b"\x00")
+            DecodeVarInt(connection)  # packet length
+            if DecodeVarInt(connection) != 0:  # packet id
+                return False
+            length = DecodeVarInt(connection)
+            if length <= 0:
+                return False
+            payload = b""
+            while len(payload) < length:
+                chunk = connection.recv(length - len(payload))
+                if not chunk:
+                    return False
+                payload += chunk
+            json.loads(payload.decode("utf-8"))
+            return True
+    except Exception:
+        return False
+
+
+def ToAbsolutePath(target):
+    """Resolve a config path against the directory MCDR was started in."""
+    return target if os.path.isabs(target) else os.path.join(path, target)
+
+
+def FindMirrorServerProperties():
+    """Locate the server.properties of the mirror server, or None if it is missing.
+
+    ``target`` is the parent directory of the mirrored worlds, which is also the
+    mirror server's working directory when the mirror server runs under MCDR. In
+    the legacy layout the server files live directly inside ./Mirror instead, so
+    both locations are checked.
+    """
+    for root in (config.get("target"), "./Mirror"):
+        if not root:
+            continue
+        candidate = os.path.normpath(
+            os.path.join(ToAbsolutePath(root), "server.properties")
+        )
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def ReadMirrorServerPort():
+    """Read server-port from the mirror server's server.properties.
+
+    Returns None when the port cannot be determined. The port is deliberately not
+    guessed: the main server usually listens on 25565, so probing a guessed port
+    could mistake the main server for the mirror server.
+    """
+    properties_path = FindMirrorServerProperties()
+    if properties_path is None:
+        return None
+    try:
+        with open(properties_path, "r", encoding="utf-8", errors="replace") as file:
+            for line in file:
+                line = line.strip()
+                if line.startswith("server-port="):
+                    return int(line.split("=", 1)[1].strip())
+    except Exception:
+        return None
+    return None
+
+
+def GetMirrorReadyProbes():
+    """Build the probes used to detect that the mirror server is up.
+
+    Both probes below only succeed once the mirror server really finished starting
+    up, unlike a plain TCP connection to its game port.
+    """
+    probes = []
+    port = ReadMirrorServerPort()
+    if port is not None:
+        probes.append(lambda: IsMinecraftServerReady("127.0.0.1", port))
+    if config["rcon"]["enable"]:
+        rcon_host = config["rcon"]["host"]
+        rcon_port = config["rcon"]["port"]
+        probes.append(lambda: IsRconPortOpen(rcon_host, rcon_port))
+    return probes
+
+
+def WaitForMirrorStart(process, timeout=None):
+    """Wait until the mirror server finished starting up.
+
+    :param process: The mirror server process, or None if it is unknown
+    :param timeout: The longest time to wait, in second
+    :return: One of the MIRROR_START_* constants
+    """
+    if timeout is None:
+        timeout = START_WAIT_TIMEOUT
+    probes = GetMirrorReadyProbes()
+    if len(probes) == 0:
+        return MIRROR_START_UNKNOWN
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process is not None and process.poll() is not None:
+            return MIRROR_START_EXITED
+        for probe in probes:
+            if probe():
+                return MIRROR_START_READY
+        time.sleep(START_WAIT_INTERVAL)
+    return MIRROR_START_TIMEOUT
+
+
+def NotifyMirrorStart(InterFace, process):
+    """Wait for the mirror server to come up, then tell the players about the result."""
+    result = WaitForMirrorStart(process)
+    if result == MIRROR_START_READY:
+        Broadcast(InterFace, "镜像服已启动完成，现在可以转服了！")
+    elif result == MIRROR_START_EXITED:
+        Broadcast(
+            InterFace,
+            "镜像服启动失败！进程已退出，请查看镜像服控制台的报错信息。",
+            RColor.red,
+        )
+    elif result == MIRROR_START_TIMEOUT:
+        Broadcast(
+            InterFace,
+            "已启动镜像服，但等待{}秒后仍未检测到启动完成，请手动检查！".format(
+                START_WAIT_TIMEOUT
+            ),
+            RColor.red,
+        )
+    else:
+        Broadcast(
+            InterFace,
+            "无法确认镜像服是否启动完成：未找到镜像服的server.properties，且Rcon未开启！",
+            RColor.red,
+        )
+
+
 @new_thread("MSR-Start")
 def CommandExecute(InterFace):
     try:
         global MirrorProcess
+        MirrorProcess = None
         if platform == "win32":
             MirrorProcess = subprocess.Popen(
                 config["command"], creationflags=subprocess.CREATE_NEW_CONSOLE
@@ -240,6 +441,8 @@ def ServerStart(InterFace):
         os.chdir(path)
     except Exception as e:
         Broadcast(InterFace, "启动失败！原因为：{}".format(e), RColor.red)
+        return
+    NotifyMirrorStart(InterFace, GetMirrorProcess())
 
 
 def Start(server):
@@ -283,9 +486,14 @@ def IsRconPortOpen(host, port, timeout=1):
         return False
 
 
+def GetMirrorProcess():
+    """Return the raw mirror server process handle, which may already have exited."""
+    return globals().get("MirrorProcess")
+
+
 def GetRunningMirrorProcess():
     """Return the mirror server process handle, or None if it is unknown or already exited."""
-    process = globals().get("MirrorProcess")
+    process = GetMirrorProcess()
     if process is not None and process.poll() is None:
         return process
     return None
