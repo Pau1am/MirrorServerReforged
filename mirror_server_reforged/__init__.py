@@ -100,8 +100,6 @@ syncFlag = False
 
 
 class MirrorStartResult(Enum):
-    """The result of WaitForMirrorStart."""
-
     READY = auto()  # the mirror server finished starting up
     EXITED = auto()  # the launch ended without the mirror server ever coming up
     TIMEOUT = auto()  # still not ready when the wait timed out
@@ -109,17 +107,14 @@ class MirrorStartResult(Enum):
 
 
 def CheckOption(name):
-    """Read one of the tunable check options from the config file."""
     return config.get("check", {}).get(name, DEFAULT_CHECK_OPTIONS[name])
 
 
 def GetMirrorDir():
-    """The directory holding the mirror server's files."""
     return os.path.join(path, "Mirror")
 
 
 def GetConfigPath():
-    """The path of this plugin's config file."""
     return os.path.join(path, "config", "MirrorServerReforged.json")
 
 
@@ -270,11 +265,6 @@ def Sync():
 
 
 def GetMirrorServerDirectories():
-    """Directories that may hold the mirror server's files, most likely first.
-
-    ``target`` is the parent directory of the mirrored worlds, which is where the mirror
-    server keeps its files. The legacy layout keeps them directly inside ./Mirror.
-    """
     directories = []
     target = config.get("target")
     if target:
@@ -286,12 +276,10 @@ def GetMirrorServerDirectories():
 
 
 def GetMirrorServerProperties():
-    """Read the mirror server's server.properties as a MirrorServerProperties object."""
     return ReadServerProperties(FindServerProperties(GetMirrorServerDirectories()))
 
 
 def IsMirrorLogActive(window=None):
-    """Check if the mirror server, or its MCDR instance, wrote a log recently."""
     if window is None:
         window = CheckOption("log_active_window")
     log_directories = GetLogDirectories(GetMirrorServerDirectories(), path)
@@ -300,7 +288,6 @@ def IsMirrorLogActive(window=None):
 
 
 def IsMirrorAlive():
-    """Check whether the mirror server is running, or still starting up."""
     if IsMirrorLogActive():
         return True
     properties = GetMirrorServerProperties()
@@ -313,7 +300,6 @@ def IsMirrorAlive():
 
 
 def GetMirrorReadyProbes():
-    """Build the probes that tell whether the mirror server is up."""
     probes = []
     properties = GetMirrorServerProperties()
     if properties.port is not None:
@@ -326,7 +312,6 @@ def GetMirrorReadyProbes():
 
 
 def DescribeMirrorReadyProbes():
-    """Describe the probes in use, to help diagnose a startup that is not detected."""
     parts = []
     properties = GetMirrorServerProperties()
     if properties.port is not None:
@@ -341,12 +326,6 @@ def DescribeMirrorReadyProbes():
 
 
 def WaitForMirrorStart(process, timeout=None):
-    """Wait until the mirror server finished starting up.
-
-    :param process: The mirror server process, or None if it is unknown
-    :param timeout: The longest time to wait, in second
-    :return: A :class:`MirrorStartResult` member
-    """
     if timeout is None:
         timeout = CheckOption("start_timeout")
     probes = GetMirrorReadyProbes()
@@ -381,7 +360,6 @@ def WaitForMirrorStart(process, timeout=None):
 
 
 def NotifyMirrorStart(InterFace, process):
-    """Wait for the mirror server to come up, then tell the players about the result."""
     InterFace.logger.info(
         "[MirrorServerReforged] 启动检测方式：{}".format(DescribeMirrorReadyProbes())
     )
@@ -505,7 +483,6 @@ def WaitForMirrorStop(host, port, process, timeout=None):
 
 @new_thread("MSR-Stop")
 def StopMirrorServer(server):
-    """Stop the mirror server via RCON and report the result back to the command source."""
     rcon_config = config["rcon"]
     host, port = rcon_config["host"], rcon_config["port"]
     # Only trust the process handle if it is still alive before the stop command is sent

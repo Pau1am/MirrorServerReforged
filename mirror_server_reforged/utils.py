@@ -12,12 +12,10 @@ from mcdreforged.api.utils import Serializable
 
 
 def ToAbsolutePath(base_dir, target):
-    """Resolve a config path against the given base directory."""
     return target if os.path.isabs(target) else os.path.join(base_dir, target)
 
 
 def FindServerProperties(candidate_dirs):
-    """Return the server.properties in the first candidate directory that has one."""
     for directory in candidate_dirs:
         candidate = os.path.join(directory, "server.properties")
         if os.path.isfile(candidate):
@@ -44,7 +42,6 @@ def GetLogDirectories(server_dirs, base_dir):
 
 
 def GetNewestLogMtime(log_directories):
-    """Return the newest modification time of any *.log in the given directories."""
     newest = None
     for log_dir in log_directories:
         try:
@@ -64,17 +61,12 @@ def GetNewestLogMtime(log_directories):
 
 
 class MirrorServerProperties(Serializable):
-    """The mirror server's server.properties, as an object.
-
-    Every value of a properties file is a string, so the fields are strings too.
-    """
-
     server_ip: str = ""
     server_port: str = ""
 
     @property
     def host(self):
-        """The address to probe: server-ip when it is set, else the loopback address."""
+        """The address to probe: server-ip when usable, else the loopback address."""
         if self.server_ip in ("", "0.0.0.0"):
             return "127.0.0.1"
         return self.server_ip
@@ -89,7 +81,6 @@ class MirrorServerProperties(Serializable):
 
 
 def ReadServerProperties(properties_path):
-    """Read a server.properties file into a MirrorServerProperties object."""
     if properties_path is None:
         return MirrorServerProperties.get_default()
     try:
@@ -109,7 +100,6 @@ def ReadServerProperties(properties_path):
 
 
 def IsTcpPortOpen(host, port, timeout=1):
-    """Check if a TCP connection can be established to the given address."""
     try:
         with socket.create_connection((host, port), timeout):
             return True
@@ -118,7 +108,6 @@ def IsTcpPortOpen(host, port, timeout=1):
 
 
 def EncodeVarInt(value):
-    """Encode an integer as a Minecraft protocol VarInt."""
     data = bytearray()
     while True:
         byte = value & 0x7F
@@ -131,7 +120,6 @@ def EncodeVarInt(value):
 
 
 def DecodeVarInt(sock):
-    """Read a Minecraft protocol VarInt from a socket."""
     value = 0
     shift = 0
     while True:
@@ -188,7 +176,6 @@ def ReadStatusPayload(host, port, protocol_version, timeout=2):
 
 
 def SendStatusRequest(host, port, protocol_version, timeout=2):
-    """Perform a Server List Ping and return the parsed status, or None on failure."""
     payload = ReadStatusPayload(host, port, protocol_version, timeout)
     if payload is None:
         return None
@@ -219,5 +206,4 @@ def GetServerProtocolVersion(host, port, timeout=2):
 
 
 def IsMinecraftServerReady(host, port, timeout=2):
-    """Check if the Minecraft server on the given port is ready for players."""
     return GetServerProtocolVersion(host, port, timeout) is not None
