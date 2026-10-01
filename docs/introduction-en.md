@@ -51,6 +51,7 @@ Now, I'll introduce the content of the config file:
     - `password` is the password of the rcon feature on your mirror server, change it as your need.
 - `source` is the save folder of you main server save.
 - `target` is the save folder of your mirror server save.
+- `check` contains the options of the mirror server startup / shutdown checks (wait timeouts, check intervals, ...). Usually no need to change them.
 
 ## Command List
 
@@ -64,27 +65,4 @@ Now, I'll introduce the content of the config file:
 !!msr status - Checkout the status of your mirror server
 ```
 
-After `!!msr start`, the plugin broadcasts a notice once the mirror server has
-**finished starting up**, so players are told when they can transfer instead of having to
-guess or watch the mirror server console themselves.
-
-How readiness is detected (printed to the MCDR console on startup, to help diagnose
-problems): the Minecraft Server List Ping of the mirror server, plus its Rcon port when
-Rcon is enabled. Plain "the game port accepts a TCP connection" is deliberately not used,
-because a server binds that port early during startup, long before it is ready.
-
-If you launch the mirror through a script, or by opening a terminal window (Windows
-`start.bat` doing `start java ...`, or macOS `open -a Terminal start_mirror.command` /
-`osascript`), the process the plugin holds usually exits before the mirror server is up.
-That is a normal hand-off: the plugin then relies on the mirror server's own activity (its
-log file being written, its ports being open) and will **not** report a failed start. A
-failed start is reported once the launch has ended and no sign of the mirror server shows
-up for 90 seconds; if the launch ends with a non-zero exit code (command not found, no
-permission, ...) it is reported immediately. If the mirror is still not ready after 300
-seconds, the plugin tells you to check it manually.
-
-After `!!msr stop`, the plugin first replies with an acknowledgement, and then sends a
-completion notice to the command source once the mirror server has **fully stopped**,
-so you can always tell whether the mirror server is really down. If the mirror server is
-still running after 120 seconds (e.g. it does not react to the stop command), the plugin
-will instead tell you to check it manually.
+After `!!msr start` the plugin broadcasts a notice once the mirror server is ready, and after `!!msr stop` it notifies the command source once the mirror server has fully stopped.

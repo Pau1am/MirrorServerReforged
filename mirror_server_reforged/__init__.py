@@ -2,12 +2,11 @@ import datetime
 import json
 import os
 import shutil
-import socket
-import struct
 import subprocess
 import sys
 import tempfile
 import time
+from enum import Enum, auto
 
 # MCDR Command & Class
 from mcdreforged.api.command import Literal, SimpleCommandBuilder, Text
@@ -15,6 +14,16 @@ from mcdreforged.api.decorator import new_thread
 from mcdreforged.api.rcon import RconConnection
 from mcdreforged.api.rtext import RColor, RText, RTextList
 from mcdreforged.mcdr_server import ServerInterface
+
+from .utils import (
+    FindServerProperties,
+    GetLogDirectories,
+    GetNewestLogMtime,
+    IsMinecraftServerReady,
+    IsTcpPortOpen,
+    ReadServerProperties,
+    ToAbsolutePath,
+)
 
 # Initalize Start
 platform = sys.platform
@@ -35,6 +44,26 @@ PLUGIN_METADATA = {
     "dependencies": {"mcdreforged": ">=2.6.0"},
 }
 
+# Defaults of the mirror server status checks. The values live in the config file so
+# that users can change them; these are only the defaults for a new config file, and for
+# the keys missing from an existing one.
+DEFAULT_CHECK_OPTIONS = {
+    # Longest time (in second) to wait for the mirror server to finish starting up
+    "start_timeout": 300,
+    # Interval (in second) between two startup checks
+    "start_interval": 2,
+    # A launcher may hand the server off and exit, so the process exit alone is not a
+    # failure: the startup is only reported as failed once the mirror server has shown
+    # no sign of life for this many seconds
+    "start_exit_grace": 90,
+    # Longest time (in second) to wait for the mirror server to be fully stopped
+    "stop_timeout": 120,
+    # Interval (in second) between two shutdown checks
+    "stop_interval": 1,
+    # How recent a write to a mirror server log counts as a sign of life, in second
+    "log_active_window": 15,
+}
+
 config = {
     "world": ["world"],
     "command": MCDR_Command,
@@ -46,6 +75,7 @@ config = {
     },
     "source": "./server",
     "target": "./Mirror/server",
+    "check": dict(DEFAULT_CHECK_OPTIONS),
 }
 
 help_msg = """{:=^50}
@@ -68,74 +98,75 @@ path = os.getcwd()
 syncFlag = False
 # Initalize End
 
-# The longest time (in second) to wait for the mirror server to be fully stopped
-# before telling the command source that the shutdown result is unknown
-STOP_WAIT_TIMEOUT = 120
-# The interval (in second) between two mirror server shutdown checks
-STOP_WAIT_INTERVAL = 1
-# The longest time (in second) to wait for the mirror server to finish starting up
-# before telling the players that the startup result is unknown
-START_WAIT_TIMEOUT = 300
-# The interval (in second) between two mirror server startup checks
-START_WAIT_INTERVAL = 2
-# A launcher that is "fire and forget" (e.g. `open -a Terminal start.command`, a
-# start.bat doing `start java ...`, or `nohup ... &`) starts the real server elsewhere
-# and exits immediately, so the process handle we hold dying does NOT mean the startup
-# failed. After the handle exits we keep waiting, and only report a failed start once
-# the mirror server has shown no sign of life for this many seconds
-START_EXIT_GRACE = 90
-# How recent a write to any mirror server log counts as a sign of life, in second
-MIRROR_ALIVE_LOG_WINDOW = 15
 
-# The result of WaitForMirrorStart
-MIRROR_START_READY = "ready"  # the mirror server finished starting up
-MIRROR_START_EXITED = "exited"  # the launch ended without the mirror server ever coming up
-MIRROR_START_TIMEOUT = "timeout"  # still not ready when the wait timed out
-MIRROR_START_UNKNOWN = "unknown"  # no usable readiness probe is available
+class MirrorStartResult(Enum):
+    """The result of WaitForMirrorStart."""
+
+    READY = auto()  # the mirror server finished starting up
+    EXITED = auto()  # the launch ended without the mirror server ever coming up
+    TIMEOUT = auto()  # still not ready when the wait timed out
+    UNKNOWN = auto()  # no usable readiness probe is available
+
+
+def CheckOption(name):
+    """Read one of the tunable check options from the config file."""
+    return config.get("check", {}).get(name, DEFAULT_CHECK_OPTIONS[name])
+
+
+def GetMirrorDir():
+    """The directory holding the mirror server's files."""
+    return os.path.join(path, "Mirror")
+
+
+def GetConfigPath():
+    """The path of this plugin's config file."""
+    return os.path.join(path, "config", "MirrorServerReforged.json")
 
 
 def InitalizeOnFirstRun():
-    if os.path.exists("./Mirror/MCDReforged.py") or "mcdreforged" in config["command"]:
+    if (
+        os.path.exists(os.path.join(GetMirrorDir(), "MCDReforged.py"))
+        or "mcdreforged" in config["command"]
+    ):
         global MCDR
         MCDR = True  # Turn on MCDR mode
-    if not os.path.exists("./Mirror"):
+    if not os.path.exists(GetMirrorDir()):
         print(
             "[MirrorServerReforged] 看起来你是第一次运行本插件？我们将会为您进行首次运行的初始化"
         )
         print("[MirrorServerReforged] 正在创建镜像文件夹……")
-        if (
-            MCDR
-        ):  # MCDR mode on, create Mirror folder and a server folder in Mirror folder
+        if MCDR:
+            # MCDR mode on, create Mirror folder and a server folder in Mirror folder
             print(
                 "[MirrorServerReforged] 检测到MCDR，我们将会按照MCDR的目录结构创建文件夹"
             )
             try:
-                os.makedirs("./Mirror")
-            except:
+                os.makedirs(GetMirrorDir())
+            except Exception:
                 print("[MirrorServerReforged] Mirror文件夹已存在！")
-            os.makedirs("./Mirror/server")
-            os.chdir("Mirror")
+            os.makedirs(os.path.join(GetMirrorDir(), "server"))
+            os.chdir(GetMirrorDir())
             # Create MCDR dictionary structure
             os.system("python3 -m mcdreforged init")
-            os.makedirs("./server/world")
+            os.makedirs(os.path.join(GetMirrorDir(), "server", "world"))
             os.chdir(path)
         else:  # MCDR mode off, turn into legacy mode. Like Vanilla, Bukkit, Waterfalls and so on.
             print(
                 "[MirrorServerReforged] 未检测到MCDR，我们将会按照普通服务器的目录结构创建文件夹"
             )
             try:
-                os.makedirs("./Mirror")
-            except:
+                os.makedirs(GetMirrorDir())
+            except Exception:
                 print("[MirrorServerReforged] Mirror文件夹已存在！")
             for world in config["world"]:
-                os.makedirs("./Mirror/{}".format(world))
+                os.makedirs(os.path.join(GetMirrorDir(), world))
         print("[MirrorServerReforged] 初始化完成！")
 
 
 def CreateConfig():
     print("[MirrorServerReforged] 正在创建配置文件……")
     global config
-    with open("./config/MirrorServerReforged.json", "w", encoding="utf-8") as f:
+    with open(GetConfigPath(), "w", encoding="utf-8") as f:
         f.write(json.dumps(config, indent=2, separators=(",", ":"), ensure_ascii=False))
         f.close()
 
@@ -148,12 +179,15 @@ def RconInit(host, port, password):
 def LoadConfig():
     print("[MirrorServerReforged] 正在加载配置文件……")
     global config
-    with open("./config/MirrorServerReforged.json", "r", encoding="utf-8") as f:
+    with open(GetConfigPath(), "r", encoding="utf-8") as f:
         config = json.load(f)
     if "source" not in config:
         config["source"] = "./server"
     if "target" not in config:
         config["target"] = "./Mirror/server"
+    check = config.setdefault("check", {})
+    for name, value in DEFAULT_CHECK_OPTIONS.items():
+        check.setdefault(name, value)
     CreateConfig()
 
 
@@ -235,255 +269,68 @@ def Sync():
         ServerSync(InterFace)
 
 
-def EncodeVarInt(value):
-    """Encode an integer as a Minecraft protocol VarInt."""
-    data = bytearray()
-    while True:
-        byte = value & 0x7F
-        value >>= 7
-        if value:
-            data.append(byte | 0x80)
-        else:
-            data.append(byte)
-            return bytes(data)
+def GetMirrorServerDirectories():
+    """Directories that may hold the mirror server's files, most likely first.
 
-
-def DecodeVarInt(sock):
-    """Read a Minecraft protocol VarInt from a socket."""
-    value = 0
-    shift = 0
-    while True:
-        chunk = sock.recv(1)
-        if not chunk:
-            raise OSError("连接已被对端关闭")
-        byte = chunk[0]
-        value |= (byte & 0x7F) << shift
-        if not byte & 0x80:
-            return value
-        shift += 7
-        if shift > 35:
-            raise OSError("VarInt 过长")
-
-
-# The protocol version sent in the handshake packet of a Server List Ping.
-# The mirror server answers the status request regardless of the version that is
-# sent, as long as it is a valid VarInt, so the exact value does not matter here
-MINECRAFT_PROTOCOL_VERSION = 767
-
-
-def IsMinecraftServerReady(host, port, timeout=2):
-    """Check if the Minecraft server on the given port finished starting up.
-
-    A plain TCP connection is not enough: a Minecraft server binds its game port
-    early during startup, so the port already accepts connections while the world
-    is still loading. The server only answers a Server List Ping once it is ready
-    for players, which is what makes the ping a reliable readiness signal.
-    """
-    try:
-        with socket.create_connection((host, port), timeout) as connection:
-            connection.settimeout(timeout)
-            host_bytes = host.encode("utf-8")
-            handshake = (
-                b"\x00"
-                + EncodeVarInt(MINECRAFT_PROTOCOL_VERSION)
-                + EncodeVarInt(len(host_bytes))
-                + host_bytes
-                + struct.pack(">H", port)
-                + b"\x01"
-            )
-            connection.sendall(EncodeVarInt(len(handshake)) + handshake)
-            connection.sendall(EncodeVarInt(1) + b"\x00")
-            DecodeVarInt(connection)  # packet length
-            if DecodeVarInt(connection) != 0:  # packet id
-                return False
-            length = DecodeVarInt(connection)
-            if length <= 0:
-                return False
-            payload = b""
-            while len(payload) < length:
-                chunk = connection.recv(length - len(payload))
-                if not chunk:
-                    return False
-                payload += chunk
-            json.loads(payload.decode("utf-8"))
-            return True
-    except Exception:
-        return False
-
-
-def ToAbsolutePath(target):
-    """Resolve a config path against the directory MCDR was started in."""
-    return target if os.path.isabs(target) else os.path.join(path, target)
-
-
-def FindMirrorServerProperties():
-    """Locate the server.properties of the mirror server, or None if it is missing.
-
-    ``target`` is the parent directory of the mirrored worlds, which is also the
-    mirror server's working directory when the mirror server runs under MCDR. In
-    the legacy layout the server files live directly inside ./Mirror instead, so
-    both locations are checked.
-    """
-    for root in (config.get("target"), "./Mirror"):
-        if not root:
-            continue
-        candidate = os.path.normpath(
-            os.path.join(ToAbsolutePath(root), "server.properties")
-        )
-        if os.path.isfile(candidate):
-            return candidate
-    return None
-
-
-def ReadMirrorServerProperties():
-    """Parse the mirror server's server.properties into a dict.
-
-    Returns an empty dict when no server.properties can be found.
-    """
-    properties_path = FindMirrorServerProperties()
-    if properties_path is None:
-        return {}
-    properties = {}
-    try:
-        with open(properties_path, "r", encoding="utf-8", errors="replace") as file:
-            for line in file:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, value = line.split("=", 1)
-                properties[key.strip()] = value.strip()
-    except Exception:
-        return {}
-    return properties
-
-
-def ReadMirrorServerPort():
-    """Read server-port from the mirror server's server.properties.
-
-    Returns None when the port cannot be determined. The port is deliberately not
-    guessed: the main server usually listens on 25565, so probing a guessed port
-    could mistake the main server for the mirror server.
-    """
-    try:
-        return int(ReadMirrorServerProperties()["server-port"])
-    except (KeyError, ValueError):
-        return None
-
-
-def ReadMirrorServerHost():
-    """Read server-ip from the mirror server's server.properties.
-
-    A mirror server configured with a fixed server-ip does not listen on the loopback
-    address, so the configured address has to be used for probing. Falls back to the
-    loopback address when server-ip is not set.
-    """
-    return ReadMirrorServerProperties().get("server-ip", "").strip() or "127.0.0.1"
-
-
-def GetMirrorLogDirectories():
-    """Candidate directories holding the mirror server's logs, most likely first.
-
-    Covered layouts:
-
-    - a plain server: ``<dir of server.properties>/logs`` (``latest.log``)
-    - a MCDR instance: ``<dir of server.properties>/logs`` for the inner server, plus
-      ``<parent>/logs`` for the MCDR instance itself (``MCDR.log``)
-
-    Any ``*.log`` inside these directories counts, so both the inner server's
-    ``latest.log`` and the MCDR instance's own log are picked up without having to
-    hard-code file names.
-
-    The MCDR root directory itself is deliberately never included: it holds the main
-    server's logs, which are always being written and would make the mirror server
-    look permanently alive.
+    ``target`` is the parent directory of the mirrored worlds, which is where the mirror
+    server keeps its files. The legacy layout keeps them directly inside ./Mirror.
     """
     directories = []
-    properties_path = FindMirrorServerProperties()
-    if properties_path is not None:
-        directories.append(os.path.join(os.path.dirname(properties_path), "logs"))
     target = config.get("target")
     if target:
-        target_absolute = ToAbsolutePath(target)
-        directories.append(os.path.join(target_absolute, "logs"))
-        # the parent of the mirrored server directory is the mirror MCDR instance root,
-        # unless it is the MCDR root itself (a plain server mirrored straight into
-        # ./Mirror would otherwise pull in the main server's logs)
-        parent = os.path.dirname(target_absolute)
-        if parent and os.path.normpath(parent) != os.path.normpath(path):
-            directories.append(os.path.join(parent, "logs"))
-    directories.append(os.path.normpath(os.path.join(path, "Mirror", "logs")))
-    unique = []
-    for directory in directories:
-        if directory not in unique:
-            unique.append(directory)
-    return unique
+        directories.append(ToAbsolutePath(path, target))
+    mirror_dir = GetMirrorDir()
+    if os.path.normpath(mirror_dir) not in (os.path.normpath(d) for d in directories):
+        directories.append(mirror_dir)
+    return directories
 
 
-def IsMirrorLogActive(window=MIRROR_ALIVE_LOG_WINDOW):
-    """Check if the mirror server, or its MCDR instance, wrote a log recently.
+def GetMirrorServerProperties():
+    """Read the mirror server's server.properties as a MirrorServerProperties object."""
+    return ReadServerProperties(FindServerProperties(GetMirrorServerDirectories()))
 
-    A server that is still starting up keeps writing to its log (mod loading, world
-    generation, ...), while a launch that never produced a server writes nothing.
-    """
-    newest = None
-    for log_dir in GetMirrorLogDirectories():
-        try:
-            names = os.listdir(log_dir)
-        except OSError:
-            continue
-        for name in names:
-            if not name.endswith(".log"):
-                continue
-            try:
-                mtime = os.path.getmtime(os.path.join(log_dir, name))
-            except OSError:
-                continue
-            if newest is None or mtime > newest:
-                newest = mtime
+
+def IsMirrorLogActive(window=None):
+    """Check if the mirror server, or its MCDR instance, wrote a log recently."""
+    if window is None:
+        window = CheckOption("log_active_window")
+    log_directories = GetLogDirectories(GetMirrorServerDirectories(), path)
+    newest = GetNewestLogMtime(log_directories)
     return newest is not None and (time.time() - newest) <= window
 
 
 def IsMirrorAlive():
-    """Best-effort check whether the mirror server is running, or still starting up.
-
-    Used to tell a mirror server that a launcher handed off to another process apart
-    from a launch that never produced a server at all.
-    """
+    """Check whether the mirror server is running, or still starting up."""
     if IsMirrorLogActive():
         return True
-    port = ReadMirrorServerPort()
-    if port is not None and IsTcpPortOpen(ReadMirrorServerHost(), port):
+    properties = GetMirrorServerProperties()
+    if properties.port is not None and IsTcpPortOpen(properties.host, properties.port):
         return True
     if config["rcon"]["enable"]:
-        if IsRconPortOpen(config["rcon"]["host"], config["rcon"]["port"]):
+        if IsTcpPortOpen(config["rcon"]["host"], config["rcon"]["port"]):
             return True
     return False
 
 
 def GetMirrorReadyProbes():
-    """Build the probes used to detect that the mirror server is up.
-
-    Both probes below only succeed once the mirror server really finished starting
-    up, unlike a plain TCP connection to its game port.
-    """
+    """Build the probes that tell whether the mirror server is up."""
     probes = []
-    port = ReadMirrorServerPort()
-    if port is not None:
-        host = ReadMirrorServerHost()
-        probes.append(lambda: IsMinecraftServerReady(host, port))
+    properties = GetMirrorServerProperties()
+    if properties.port is not None:
+        probes.append(lambda: IsMinecraftServerReady(properties.host, properties.port))
     if config["rcon"]["enable"]:
         rcon_host = config["rcon"]["host"]
         rcon_port = config["rcon"]["port"]
-        probes.append(lambda: IsRconPortOpen(rcon_host, rcon_port))
+        probes.append(lambda: IsTcpPortOpen(rcon_host, rcon_port))
     return probes
 
 
 def DescribeMirrorReadyProbes():
     """Describe the probes in use, to help diagnose a startup that is not detected."""
     parts = []
-    port = ReadMirrorServerPort()
-    if port is not None:
-        parts.append("状态查询 {}:{}".format(ReadMirrorServerHost(), port))
+    properties = GetMirrorServerProperties()
+    if properties.port is not None:
+        parts.append("状态查询 {}:{}".format(properties.host, properties.port))
     else:
         parts.append("状态查询不可用（未读到 server-port）")
     if config["rcon"]["enable"]:
@@ -498,20 +345,20 @@ def WaitForMirrorStart(process, timeout=None):
 
     :param process: The mirror server process, or None if it is unknown
     :param timeout: The longest time to wait, in second
-    :return: One of the MIRROR_START_* constants
+    :return: A :class:`MirrorStartResult` member
     """
     if timeout is None:
-        timeout = START_WAIT_TIMEOUT
+        timeout = CheckOption("start_timeout")
     probes = GetMirrorReadyProbes()
     if len(probes) == 0:
-        return MIRROR_START_UNKNOWN
+        return MirrorStartResult.UNKNOWN
     deadline = time.monotonic() + timeout
     exited_at = None
     last_alive_at = None
     while time.monotonic() < deadline:
         for probe in probes:
             if probe():
-                return MIRROR_START_READY
+                return MirrorStartResult.READY
         if process is not None and process.poll() is not None:
             now = time.monotonic()
             first_check = exited_at is None
@@ -520,20 +367,17 @@ def WaitForMirrorStart(process, timeout=None):
             alive = IsMirrorAlive()
             exit_code = getattr(process, "returncode", None)
             if first_check and exit_code not in (0, None) and not alive:
-                # a non-zero exit code with no sign of life means the launch itself
-                # failed (command not found, permission denied, ...): a reliable signal
-                return MIRROR_START_EXITED
+                # the launch itself failed, e.g. command not found or no permission
+                return MirrorStartResult.EXITED
             if alive:
-                # a fire-and-forget launcher handed the server off to another process,
-                # or the server is still starting up: keep waiting instead of failing
+                # the launcher handed the server off, or it is still starting up
                 last_alive_at = now
             else:
-                # only give up after the mirror server showed no sign of life at all
                 reference = exited_at if last_alive_at is None else max(exited_at, last_alive_at)
-                if now - reference >= START_EXIT_GRACE:
-                    return MIRROR_START_EXITED
-        time.sleep(START_WAIT_INTERVAL)
-    return MIRROR_START_TIMEOUT
+                if now - reference >= CheckOption("start_exit_grace"):
+                    return MirrorStartResult.EXITED
+        time.sleep(CheckOption("start_interval"))
+    return MirrorStartResult.TIMEOUT
 
 
 def NotifyMirrorStart(InterFace, process):
@@ -542,19 +386,19 @@ def NotifyMirrorStart(InterFace, process):
         "[MirrorServerReforged] 启动检测方式：{}".format(DescribeMirrorReadyProbes())
     )
     result = WaitForMirrorStart(process)
-    if result == MIRROR_START_READY:
+    if result is MirrorStartResult.READY:
         Broadcast(InterFace, "镜像服已启动完成，现在可以转服了！")
-    elif result == MIRROR_START_EXITED:
+    elif result is MirrorStartResult.EXITED:
         Broadcast(
             InterFace,
             "镜像服启动失败！启动进程已退出，且未检测到镜像服运行，请查看镜像服控制台的报错信息。",
             RColor.red,
         )
-    elif result == MIRROR_START_TIMEOUT:
+    elif result is MirrorStartResult.TIMEOUT:
         Broadcast(
             InterFace,
             "已启动镜像服，但等待{}秒后仍未检测到启动完成，请手动检查！（检测方式：{}）".format(
-                START_WAIT_TIMEOUT, DescribeMirrorReadyProbes()
+                CheckOption("start_timeout"), DescribeMirrorReadyProbes()
             ),
             RColor.red,
         )
@@ -586,7 +430,7 @@ def CommandExecute(InterFace):
 def ServerStart(InterFace):
     # global Started
     try:
-        os.chdir("Mirror")
+        os.chdir(GetMirrorDir())
         CommandExecute(InterFace)
         time.sleep(5)
         os.chdir(path)
@@ -628,20 +472,6 @@ def GetInterFace(*args):
 #         server.reply('§b[MirrorServerReforged] §6镜像服未运行……')
 
 
-def IsTcpPortOpen(host, port, timeout=1):
-    """Check if a TCP connection can be established to the given address."""
-    try:
-        with socket.create_connection((host, port), timeout):
-            return True
-    except OSError:
-        return False
-
-
-def IsRconPortOpen(host, port, timeout=1):
-    """Check if the RCON port of the mirror server accepts connections."""
-    return IsTcpPortOpen(host, port, timeout)
-
-
 def GetMirrorProcess():
     """Return the raw mirror server process handle, which may already have exited."""
     return globals().get("MirrorProcess")
@@ -658,21 +488,18 @@ def GetRunningMirrorProcess():
 def WaitForMirrorStop(host, port, process, timeout=None):
     """Wait until the mirror server is fully stopped.
 
-    The mirror server process is the most reliable signal, so it is used first.
-    When the process handle is unavailable (for example the mirror server was started
-    outside of this plugin), the RCON port is used instead: the mirror server is
-    considered stopped once its RCON port no longer accepts connections.
+    The process handle is used when it is available, otherwise the RCON port.
     """
     if timeout is None:
-        timeout = STOP_WAIT_TIMEOUT
+        timeout = CheckOption("stop_timeout")
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if process is not None:
             if process.poll() is not None:
                 return True
-        elif not IsRconPortOpen(host, port):
+        elif not IsTcpPortOpen(host, port):
             return True
-        time.sleep(STOP_WAIT_INTERVAL)
+        time.sleep(CheckOption("stop_interval"))
     return False
 
 
@@ -706,7 +533,7 @@ def StopMirrorServer(server):
             pass
 
     # Report the timeout value that was really used
-    timeout = STOP_WAIT_TIMEOUT
+    timeout = CheckOption("stop_timeout")
     if WaitForMirrorStop(host, port, process, timeout):
         server.reply("§b[MirrorServerReforged] §6镜像服已彻底关闭！")
     else:
@@ -746,7 +573,7 @@ def DisplayHelp(server):
 def MCDRInitalize(server):
     if MCDR:
         try:
-            os.chdir("Mirror")
+            os.chdir(GetMirrorDir())
             system = sys.platform
             if system == "win32":
                 # Windows NT Platform
@@ -768,7 +595,7 @@ def Initalize(server):
 
 
 def ConfigToDo():
-    if os.path.exists("./config/MirrorServerReforged.json"):
+    if os.path.exists(GetConfigPath()):
         LoadConfig()
     else:
         CreateConfig()
