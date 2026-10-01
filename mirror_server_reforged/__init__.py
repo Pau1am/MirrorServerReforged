@@ -2,6 +2,7 @@ import datetime
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -65,6 +66,12 @@ MCDR = False  # MCDR mode controller
 path = os.getcwd()
 syncFlag = False
 # Initalize End
+
+# The longest time (in second) to wait for the mirror server to be fully stopped
+# before telling the command source that the shutdown result is unknown
+STOP_WAIT_TIMEOUT = 120
+# The interval (in second) between two mirror server shutdown checks
+STOP_WAIT_INTERVAL = 1
 
 
 def InitalizeOnFirstRun():
@@ -267,22 +274,91 @@ def GetInterFace(*args):
 #         server.reply('§b[MirrorServerReforged] §6镜像服未运行……')
 
 
+def IsRconPortOpen(host, port, timeout=1):
+    """Check if the RCON port of the mirror server still accepts connections."""
+    try:
+        with socket.create_connection((host, port), timeout):
+            return True
+    except OSError:
+        return False
+
+
+def GetRunningMirrorProcess():
+    """Return the mirror server process handle, or None if it is unknown or already exited."""
+    process = globals().get("MirrorProcess")
+    if process is not None and process.poll() is None:
+        return process
+    return None
+
+
+def WaitForMirrorStop(host, port, process, timeout=None):
+    """Wait until the mirror server is fully stopped.
+
+    The mirror server process is the most reliable signal, so it is used first.
+    When the process handle is unavailable (for example the mirror server was started
+    outside of this plugin), the RCON port is used instead: the mirror server is
+    considered stopped once its RCON port no longer accepts connections.
+    """
+    if timeout is None:
+        timeout = STOP_WAIT_TIMEOUT
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process is not None:
+            if process.poll() is not None:
+                return True
+        elif not IsRconPortOpen(host, port):
+            return True
+        time.sleep(STOP_WAIT_INTERVAL)
+    return False
+
+
+@new_thread("MSR-Stop")
+def StopMirrorServer(server):
+    """Stop the mirror server via RCON and report the result back to the command source."""
+    rcon_config = config["rcon"]
+    host, port = rcon_config["host"], rcon_config["port"]
+    # Only trust the process handle if it is still alive before the stop command is sent
+    process = GetRunningMirrorProcess()
+    conn = RconInit(host, port, rcon_config["password"])
+    try:
+        connected = conn.connect()
+    except Exception as e:
+        server.reply("§b[MirrorServerReforged] §6无法连接镜像服的Rcon！原因为：{}".format(e))
+        return
+    if not connected:
+        server.reply(
+            "§b[MirrorServerReforged] §6无法连接镜像服的Rcon，请检查配置文件中的Rcon信息！"
+        )
+        return
+    try:
+        conn.send_command("stop", max_retry_time=3)
+    except Exception as e:
+        server.reply("§b[MirrorServerReforged] §6无法停止镜像服！原因为：{}".format(e))
+        return
+    finally:
+        try:
+            conn.disconnect()
+        except Exception:
+            pass
+
+    # Report the timeout value that was really used
+    timeout = STOP_WAIT_TIMEOUT
+    if WaitForMirrorStop(host, port, process, timeout):
+        server.reply("§b[MirrorServerReforged] §6镜像服已彻底关闭！")
+    else:
+        server.reply(
+            "§b[MirrorServerReforged] §6已向镜像服发送关闭指令，但等待{}秒后仍未检测到镜像服关闭，请手动检查！".format(
+                timeout
+            )
+        )
+
+
 def Stop(server):
     # global Started
     # if Started:
     if config["rcon"]["enable"]:
-        conn = RconInit(
-            config["rcon"]["host"], config["rcon"]["port"], config["rcon"]["password"]
-        )
-        try:
-            connected = conn.connect()
-            if connected:
-                conn.send_command("stop", max_retry_time=3)
-                conn.disconnect()
-        except Exception as e:
-            server.reply(
-                "§b[MirrorServerReforged] §6无法停止镜像服！原因为：{}".format(e)
-            )
+        server.reply("§b[MirrorServerReforged] §6正在向镜像服发送关闭指令……")
+        StopMirrorServer(server)
     else:
         server.reply(
             "§b[MirrorServerReforged] §6无法通过Rcon停止镜像服，因为Rcon未开启！"

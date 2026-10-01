@@ -63,3 +63,9 @@ Now, I'll introduce the content of the config file:
 !!msr init - Initalize mirror server (Use it only when you use MCDR in your mirror server)
 !!msr status - Checkout the status of your mirror server
 ```
+
+After `!!msr stop`, the plugin first replies with an acknowledgement, and then sends a
+completion notice to the command source once the mirror server has **fully stopped**,
+so you can always tell whether the mirror server is really down. If the mirror server is
+still running after 120 seconds (e.g. it does not react to the stop command), the plugin
+will instead tell you to check it manually.
