@@ -52,6 +52,12 @@ Now, I'll introduce the content of the config file:
 - `source` is the save folder of you main server save.
 - `target` is the save folder of your mirror server save.
 - `check` contains the options of the mirror server startup / shutdown checks (wait timeouts, check intervals, ...). Usually no need to change them.
+- `idle_shutdown` contains the options of the idle shutdown, which is disabled by default.
+    - `enable` is the switch of the idle shutdown. Once it is `true`, the mirror server is stopped automatically when nobody has played on it for a while (the rcon feature is needed).
+    - `idle_timeout` is how long (in second) the mirror server may stay empty before it is stopped, e.g. `1800` for half an hour.
+    - `notice_advance` is how long (in second) before that shutdown the players are warned about it, e.g. `300` for 5 minutes.
+    - `countdown` is how many seconds before that shutdown the countdown is broadcast every second, `10` by default.
+    - `check_interval` is the interval (in second) between two online player checks.
 
 ## Command List
 
@@ -66,3 +72,5 @@ Now, I'll introduce the content of the config file:
 ```
 
 After `!!msr start` the plugin broadcasts a notice once the mirror server is ready, and after `!!msr stop` it notifies the command source once the mirror server has fully stopped.
+
+With `idle_shutdown` enabled the mirror server is stopped automatically once it has stayed empty for `idle_timeout`: the players are warned once `notice_advance` before the shutdown, a countdown is broadcast every second during the last 10 seconds, and one more notice follows after the mirror server has fully stopped. A player joining the mirror server during that countdown cancels the shutdown.

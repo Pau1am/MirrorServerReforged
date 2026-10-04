@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from enum import Enum, auto
 
@@ -19,6 +20,7 @@ from .utils import (
     FindServerProperties,
     GetLogDirectories,
     GetNewestLogMtime,
+    GetOnlinePlayerCount,
     IsMinecraftServerReady,
     IsTcpPortOpen,
     ReadServerProperties,
@@ -64,6 +66,21 @@ DEFAULT_CHECK_OPTIONS = {
     "log_active_window": 15,
 }
 
+# Defaults of the idle shutdown. As above, these are only the defaults for the values
+# missing from the config file.
+DEFAULT_IDLE_OPTIONS = {
+    # Whether the mirror server is shut down automatically once it stays empty
+    "enable": False,
+    # Longest time (in second) the mirror server may stay empty before it is shut down
+    "idle_timeout": 1800,
+    # How long (in second) before that shutdown the players are warned about it
+    "notice_advance": 300,
+    # How many seconds before that shutdown the countdown is broadcast every second
+    "countdown": 10,
+    # Interval (in second) between two online player checks
+    "check_interval": 10,
+}
+
 config = {
     "world": ["world"],
     "command": MCDR_Command,
@@ -76,6 +93,7 @@ config = {
     "source": "./server",
     "target": "./Mirror/server",
     "check": dict(DEFAULT_CHECK_OPTIONS),
+    "idle_shutdown": dict(DEFAULT_IDLE_OPTIONS),
 }
 
 help_msg = """{:=^50}
@@ -106,8 +124,28 @@ class MirrorStartResult(Enum):
     UNKNOWN = auto()  # no usable readiness probe is available
 
 
+class MirrorStopResult(Enum):
+    STOPPED = auto()  # the mirror server is fully stopped
+    RCON_FAILED = auto()  # the Rcon connection could not be established
+    SEND_FAILED = auto()  # the stop command could not be delivered
+    TIMEOUT = auto()  # the stop command was sent, but the mirror server outlived the wait
+
+
 def CheckOption(name):
     return config.get("check", {}).get(name, DEFAULT_CHECK_OPTIONS[name])
+
+
+def IdleOption(name):
+    return config.get("idle_shutdown", {}).get(name, DEFAULT_IDLE_OPTIONS[name])
+
+
+def FormatDuration(seconds):
+    seconds = int(seconds)
+    if seconds < 60:
+        return "{}秒".format(seconds)
+    if seconds % 60 == 0:
+        return "{}分钟".format(seconds // 60)
+    return "{}分{}秒".format(seconds // 60, seconds % 60)
 
 
 def GetMirrorDir():
@@ -183,6 +221,9 @@ def LoadConfig():
     check = config.setdefault("check", {})
     for name, value in DEFAULT_CHECK_OPTIONS.items():
         check.setdefault(name, value)
+    idle_shutdown = config.setdefault("idle_shutdown", {})
+    for name, value in DEFAULT_IDLE_OPTIONS.items():
+        idle_shutdown.setdefault(name, value)
     CreateConfig()
 
 
@@ -277,6 +318,14 @@ def GetMirrorServerDirectories():
 
 def GetMirrorServerProperties():
     return ReadServerProperties(FindServerProperties(GetMirrorServerDirectories()))
+
+
+def GetMirrorOnlinePlayers():
+    """Return the mirror server's online player count, or None when it cannot be read."""
+    properties = GetMirrorServerProperties()
+    if properties.port is None:
+        return None
+    return GetOnlinePlayerCount(properties.host, properties.port)
 
 
 def IsMirrorLogActive(window=None):
@@ -481,8 +530,11 @@ def WaitForMirrorStop(host, port, process, timeout=None):
     return False
 
 
-@new_thread("MSR-Stop")
-def StopMirrorServer(server):
+def SendMirrorStop():
+    """Ask the mirror server to stop through Rcon, and wait until it is really gone.
+
+    Returns a MirrorStopResult together with a message describing a failure, or None.
+    """
     rcon_config = config["rcon"]
     host, port = rcon_config["host"], rcon_config["port"]
     # Only trust the process handle if it is still alive before the stop command is sent
@@ -491,18 +543,16 @@ def StopMirrorServer(server):
     try:
         connected = conn.connect()
     except Exception as e:
-        server.reply("§b[MirrorServerReforged] §6无法连接镜像服的Rcon！原因为：{}".format(e))
-        return
+        return MirrorStopResult.RCON_FAILED, "无法连接镜像服的Rcon！原因为：{}".format(e)
     if not connected:
-        server.reply(
-            "§b[MirrorServerReforged] §6无法连接镜像服的Rcon，请检查配置文件中的Rcon信息！"
+        return (
+            MirrorStopResult.RCON_FAILED,
+            "无法连接镜像服的Rcon，请检查配置文件中的Rcon信息！",
         )
-        return
     try:
         conn.send_command("stop", max_retry_time=3)
     except Exception as e:
-        server.reply("§b[MirrorServerReforged] §6无法停止镜像服！原因为：{}".format(e))
-        return
+        return MirrorStopResult.SEND_FAILED, "无法停止镜像服！原因为：{}".format(e)
     finally:
         try:
             conn.disconnect()
@@ -512,13 +562,20 @@ def StopMirrorServer(server):
     # Report the timeout value that was really used
     timeout = CheckOption("stop_timeout")
     if WaitForMirrorStop(host, port, process, timeout):
+        return MirrorStopResult.STOPPED, None
+    return (
+        MirrorStopResult.TIMEOUT,
+        "已向镜像服发送关闭指令，但等待{}秒后仍未检测到镜像服关闭，请手动检查！".format(timeout),
+    )
+
+
+@new_thread("MSR-Stop")
+def StopMirrorServer(server):
+    result, detail = SendMirrorStop()
+    if result is MirrorStopResult.STOPPED:
         server.reply("§b[MirrorServerReforged] §6镜像服已彻底关闭！")
     else:
-        server.reply(
-            "§b[MirrorServerReforged] §6已向镜像服发送关闭指令，但等待{}秒后仍未检测到镜像服关闭，请手动检查！".format(
-                timeout
-            )
-        )
+        server.reply("§b[MirrorServerReforged] §6{}".format(detail))
 
 
 def Stop(server):
@@ -533,6 +590,103 @@ def Stop(server):
         )
     # else:
     #     server.reply('§b[MirrorServerReforged] §6镜像服未运行！')
+
+
+# The mirror server is shut down automatically once it has stayed empty for a while. The
+# watchdog thread below owns that state, and `on_unload` is what stops it.
+idle_stop_event = threading.Event()
+
+
+def IdleShutdownProblem():
+    """Return why the idle shutdown cannot work, or None when it can."""
+    if not config["rcon"]["enable"]:
+        return "Rcon 未开启，镜像服无法被自动关闭"
+    if GetMirrorServerProperties().port is None:
+        return "未找到镜像服的 server.properties，无法统计镜像服的在线人数"
+    return None
+
+
+def AutoStopMirrorServer(InterFace):
+    """Stop the idle mirror server and tell the players how it went."""
+    result, detail = SendMirrorStop()
+    if result is MirrorStopResult.STOPPED:
+        Broadcast(InterFace, "镜像服长时间无人使用，已自动关闭！")
+    else:
+        InterFace.logger.warning("[MirrorServerReforged] 自动关闭镜像服失败：{}".format(detail))
+        Broadcast(InterFace, "自动关闭镜像服失败，请手动检查！", RColor.red)
+
+
+def RunMirrorIdleShutdown(InterFace, stop_event):
+    """Count the last seconds down, then stop the mirror server.
+
+    A player showing up during the countdown cancels the shutdown.
+    """
+    for remaining in range(IdleOption("countdown"), 0, -1):
+        players = GetMirrorOnlinePlayers()
+        if players is None:
+            Broadcast(InterFace, "无法确认镜像服的在线人数，已取消自动关闭！", RColor.red)
+            return
+        if players > 0:
+            Broadcast(InterFace, "检测到镜像服有玩家在线，已取消自动关闭！")
+            return
+        Broadcast(InterFace, "镜像服还有{}秒关闭！".format(remaining))
+        if stop_event.wait(1):
+            return
+    AutoStopMirrorServer(InterFace)
+
+
+@new_thread("MSR-Idle")
+def WatchMirrorIdle(InterFace):
+    # Bind the event locally: a plugin reload replaces the module level one, and this thread
+    # still has to be stoppable by the `on_unload` of the plugin instance that started it
+    stop_event = idle_stop_event
+    idle_seconds = 0
+    noticed = False
+    problem = None
+    last_check = time.monotonic()
+    while not stop_event.is_set():
+        stop_event.wait(max(1, IdleOption("check_interval")))
+        if stop_event.is_set():
+            break
+        now = time.monotonic()
+        elapsed = now - last_check
+        last_check = now
+
+        if not IdleOption("enable"):
+            problem = None
+            idle_seconds = 0
+            noticed = False
+            continue
+
+        current_problem = IdleShutdownProblem()
+        if current_problem != problem:
+            if current_problem is not None:
+                InterFace.logger.warning(
+                    "[MirrorServerReforged] 自动关闭镜像服已启用，但{}".format(current_problem)
+                )
+            problem = current_problem
+        if current_problem is not None:
+            idle_seconds = 0
+            noticed = False
+            continue
+
+        players = GetMirrorOnlinePlayers()
+        if players is None or players > 0:
+            idle_seconds = 0
+            noticed = False
+            continue
+
+        idle_seconds += elapsed
+        timeout = IdleOption("idle_timeout")
+        advance = IdleOption("notice_advance")
+        if not noticed and idle_seconds >= timeout - advance:
+            noticed = True
+            Broadcast(InterFace, "镜像服还有{}关闭！".format(FormatDuration(advance)))
+        if idle_seconds >= timeout - IdleOption("countdown"):
+            RunMirrorIdleShutdown(InterFace, stop_event)
+            idle_seconds = 0
+            noticed = False
+            last_check = time.monotonic()
 
 
 def Reload(server):
@@ -579,6 +733,7 @@ def ConfigToDo():
 
 
 def on_load(server, prev):
+    global idle_stop_event
     ConfigToDo()  # Load Config
     InitalizeOnFirstRun()  # Initalize if this is the first run
     # builder = SimpleCommandBuilder()
@@ -602,3 +757,9 @@ def on_load(server, prev):
     # builder.command('!!msr stop', Stop)
     # builder.command('!!msr init', Initalize)
     # builder.register(server)
+    idle_stop_event = threading.Event()
+    WatchMirrorIdle(GetInterFace())
+
+
+def on_unload(server):
+    idle_stop_event.set()

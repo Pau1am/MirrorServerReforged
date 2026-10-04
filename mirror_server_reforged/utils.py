@@ -182,8 +182,8 @@ def SendStatusRequest(host, port, protocol_version, timeout=2):
         return None
 
 
-def GetServerProtocolVersion(host, port, timeout=2):
-    """Return the protocol version the server reports, caching the answer.
+def GetServerStatus(host, port, timeout=2):
+    """Return the status the server answers with, remembering the protocol version it reports.
 
     Returns None when the server does not answer.
     """
@@ -198,8 +198,24 @@ def GetServerProtocolVersion(host, port, timeout=2):
     protocol = (status.get("version") or {}).get("protocol")
     if isinstance(protocol, int):
         _protocol_version = protocol
-        return protocol
-    return None
+    return status
+
+
+def GetServerProtocolVersion(host, port, timeout=2):
+    status = GetServerStatus(host, port, timeout)
+    if status is None:
+        return None
+    protocol = (status.get("version") or {}).get("protocol")
+    return protocol if isinstance(protocol, int) else None
+
+
+def GetOnlinePlayerCount(host, port, timeout=2):
+    """Return the online player count the server reports, or None when it does not answer."""
+    status = GetServerStatus(host, port, timeout)
+    if status is None:
+        return None
+    online = (status.get("players") or {}).get("online")
+    return online if isinstance(online, int) else None
 
 
 def IsMinecraftServerReady(host, port, timeout=2):
