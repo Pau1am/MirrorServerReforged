@@ -347,8 +347,32 @@ def GetMirrorServerDirectories():
     return directories
 
 
+# The properties file is read on every online player check, and it only changes when the
+# mirror server is reconfigured, so the parsed result is kept until the file it came from
+# changes. `ConfigToDo` drops it as well, so a reload picks up an edited file right away.
+mirror_properties = None
+mirror_properties_source = None
+
+
 def GetMirrorServerProperties():
-    return ReadServerProperties(FindServerProperties(GetMirrorServerDirectories()))
+    global mirror_properties, mirror_properties_source
+    properties_path = FindServerProperties(GetMirrorServerDirectories())
+    try:
+        stamp = os.path.getmtime(properties_path) if properties_path else None
+    except OSError:
+        stamp = None
+    source = (properties_path, stamp)
+    if mirror_properties is None or mirror_properties_source != source:
+        mirror_properties = ReadServerProperties(properties_path)
+        mirror_properties_source = source
+    return mirror_properties
+
+
+def DropMirrorServerProperties():
+    """Forget the cached mirror server properties, so the next read goes to the file."""
+    global mirror_properties, mirror_properties_source
+    mirror_properties = None
+    mirror_properties_source = None
 
 
 def GetMirrorOnlinePlayers():
@@ -806,6 +830,9 @@ def Initalize(server):
 
 
 def ConfigToDo():
+    # The mirror server may have been reconfigured while the plugin was running, and its
+    # properties are cached, so drop that cache before the new config is read
+    DropMirrorServerProperties()
     if os.path.exists(GetConfigPath()):
         LoadConfig()
     else:
