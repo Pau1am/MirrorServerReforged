@@ -234,6 +234,32 @@ def Broadcast(InterFace, message, color=RColor.gold):
     )
 
 
+def MirrorBroadcast(InterFace, message, color=RColor.gold):
+    """Broadcast the very same notice to the mirror server through Rcon."""
+    rcon_config = config["rcon"]
+    if not rcon_config["enable"]:
+        return
+    tellraw = RTextList(
+        RText("[MirrorServerReforged] ", RColor.aqua), RText(message, color)
+    )
+    conn = RconInit(rcon_config["host"], rcon_config["port"], rcon_config["password"])
+    try:
+        if not conn.connect():
+            raise RuntimeError("无法连接镜像服的Rcon")
+        conn.send_command(
+            "tellraw @a {}".format(tellraw.to_json_str()), max_retry_time=3
+        )
+    except Exception as e:
+        InterFace.logger.warning(
+            "[MirrorServerReforged] 无法向镜像服广播消息！原因为：{}".format(e)
+        )
+    finally:
+        try:
+            conn.disconnect()
+        except Exception:
+            pass
+
+
 def CopyWorld(source_root, target_root, world):
     """Copy a world into place without deleting the last good mirror first."""
     source = os.path.abspath(os.path.join(source_root, world))
@@ -616,18 +642,26 @@ def AutoStopMirrorServer(InterFace):
         Broadcast(InterFace, "自动关闭镜像服失败，请手动检查！", RColor.red)
 
 
+def CancelIdleShutdown(InterFace, message, color=RColor.gold):
+    """Tell both the main server and the mirror server that the countdown was called off."""
+    Broadcast(InterFace, message, color)
+    MirrorBroadcast(InterFace, message, color)
+
+
 def RunMirrorIdleShutdown(InterFace, stop_event):
     """Count the last seconds down, then stop the mirror server.
 
-    A player showing up during the countdown cancels the shutdown.
+    A player showing up during the countdown calls it off: the mirror server keeps
+    running, and the watchdog starts the whole idle check over again.
     """
     for remaining in range(IdleOption("countdown"), 0, -1):
         players = GetMirrorOnlinePlayers()
         if players is None:
+            # A probe failure is an admin problem, so it only goes to the main server
             Broadcast(InterFace, "无法确认镜像服的在线人数，已取消自动关闭！", RColor.red)
             return
         if players > 0:
-            Broadcast(InterFace, "检测到镜像服有玩家在线，已取消自动关闭！")
+            CancelIdleShutdown(InterFace, "镜像服有玩家加入，倒计时中止！")
             return
         Broadcast(InterFace, "镜像服还有{}秒关闭！".format(remaining))
         if stop_event.wait(1):
