@@ -77,8 +77,13 @@ DEFAULT_IDLE_OPTIONS = {
     "notice_advance": 300,
     # How many seconds before that shutdown the countdown is broadcast every second
     "countdown": 10,
-    # Interval (in second) between two online player checks
-    "check_interval": 10,
+    # Interval (in second) between two online player checks while the shutdown is still far
+    # away. The players are not going anywhere before the countdown, so a check now and then
+    # is enough, and it keeps the watchdog cheap
+    "check_interval": 300,
+    # Interval (in second) between two online player checks once the players have been
+    # warned: from then on the shutdown can happen at any moment, so the checks get fine
+    "near_check_interval": 10,
 }
 
 config = {
@@ -632,6 +637,33 @@ def IdleShutdownProblem():
     return None
 
 
+def NextIdleCheckDelay(idle_seconds, problem):
+    """How long to wait (in second) before the next online player check.
+
+    The checks stay coarse while the shutdown is far away, and get fine once the players
+    have been warned about it. The delay never runs past the next milestone, so neither the
+    notice nor the countdown is pushed back by a coarse interval.
+
+    Nothing is being counted while the shutdown is off or unusable, and only the config can
+    change then, so a cheap local recheck is enough.
+    """
+    if problem is not None or not IdleOption("enable"):
+        return max(1, IdleOption("near_check_interval"))
+    timeout = IdleOption("idle_timeout")
+    notice_at = timeout - IdleOption("notice_advance")
+    countdown_at = timeout - IdleOption("countdown")
+    if idle_seconds >= notice_at:
+        interval = IdleOption("near_check_interval")
+        milestone = countdown_at
+    else:
+        interval = IdleOption("check_interval")
+        milestone = notice_at
+    remaining = milestone - idle_seconds
+    if remaining > 0:
+        interval = min(interval, remaining)
+    return max(1, interval)
+
+
 def AutoStopMirrorServer(InterFace):
     """Stop the idle mirror server and tell the players how it went."""
     result, detail = SendMirrorStop()
@@ -648,6 +680,23 @@ def CancelIdleShutdown(InterFace, message, color=RColor.gold):
     MirrorBroadcast(InterFace, message, color)
 
 
+def CheckMirrorStillEmpty(InterFace):
+    """Return True while the mirror server is still empty, calling the shutdown off if not.
+
+    The countdown is checked every second, so a player joining in the middle of it is seen
+    right away instead of at the next coarse check.
+    """
+    players = GetMirrorOnlinePlayers()
+    if players is None:
+        # A probe failure is an admin problem, so it only goes to the main server
+        Broadcast(InterFace, "无法确认镜像服的在线人数，已取消自动关闭！", RColor.red)
+        return False
+    if players > 0:
+        CancelIdleShutdown(InterFace, "镜像服有玩家加入，倒计时中止！")
+        return False
+    return True
+
+
 def RunMirrorIdleShutdown(InterFace, stop_event):
     """Count the last seconds down, then stop the mirror server.
 
@@ -655,18 +704,14 @@ def RunMirrorIdleShutdown(InterFace, stop_event):
     running, and the watchdog starts the whole idle check over again.
     """
     for remaining in range(IdleOption("countdown"), 0, -1):
-        players = GetMirrorOnlinePlayers()
-        if players is None:
-            # A probe failure is an admin problem, so it only goes to the main server
-            Broadcast(InterFace, "无法确认镜像服的在线人数，已取消自动关闭！", RColor.red)
-            return
-        if players > 0:
-            CancelIdleShutdown(InterFace, "镜像服有玩家加入，倒计时中止！")
+        if not CheckMirrorStillEmpty(InterFace):
             return
         Broadcast(InterFace, "镜像服还有{}秒关闭！".format(remaining))
         if stop_event.wait(1):
             return
-    AutoStopMirrorServer(InterFace)
+    # A player may have joined during the last broadcast, so look once more before the stop
+    if CheckMirrorStillEmpty(InterFace):
+        AutoStopMirrorServer(InterFace)
 
 
 @new_thread("MSR-Idle")
@@ -678,10 +723,9 @@ def WatchMirrorIdle(InterFace):
     noticed = False
     problem = None
     last_check = time.monotonic()
+    # Check first and wait afterwards, so that a setup the idle shutdown cannot work with is
+    # reported as soon as the plugin loads instead of a whole interval later
     while not stop_event.is_set():
-        stop_event.wait(max(1, IdleOption("check_interval")))
-        if stop_event.is_set():
-            break
         now = time.monotonic()
         elapsed = now - last_check
         last_check = now
@@ -690,37 +734,39 @@ def WatchMirrorIdle(InterFace):
             problem = None
             idle_seconds = 0
             noticed = False
-            continue
-
-        current_problem = IdleShutdownProblem()
-        if current_problem != problem:
+        else:
+            current_problem = IdleShutdownProblem()
+            if current_problem != problem:
+                if current_problem is not None:
+                    InterFace.logger.warning(
+                        "[MirrorServerReforged] 自动关闭镜像服已启用，但{}".format(current_problem)
+                    )
+                problem = current_problem
             if current_problem is not None:
-                InterFace.logger.warning(
-                    "[MirrorServerReforged] 自动关闭镜像服已启用，但{}".format(current_problem)
-                )
-            problem = current_problem
-        if current_problem is not None:
-            idle_seconds = 0
-            noticed = False
-            continue
+                idle_seconds = 0
+                noticed = False
+            else:
+                players = GetMirrorOnlinePlayers()
+                if players is None or players > 0:
+                    idle_seconds = 0
+                    noticed = False
+                else:
+                    idle_seconds += elapsed
+                    timeout = IdleOption("idle_timeout")
+                    advance = IdleOption("notice_advance")
+                    if not noticed and idle_seconds >= timeout - advance:
+                        noticed = True
+                        Broadcast(
+                            InterFace, "镜像服还有{}关闭！".format(FormatDuration(advance))
+                        )
+                    if idle_seconds >= timeout - IdleOption("countdown"):
+                        RunMirrorIdleShutdown(InterFace, stop_event)
+                        idle_seconds = 0
+                        noticed = False
+                        last_check = time.monotonic()
 
-        players = GetMirrorOnlinePlayers()
-        if players is None or players > 0:
-            idle_seconds = 0
-            noticed = False
-            continue
-
-        idle_seconds += elapsed
-        timeout = IdleOption("idle_timeout")
-        advance = IdleOption("notice_advance")
-        if not noticed and idle_seconds >= timeout - advance:
-            noticed = True
-            Broadcast(InterFace, "镜像服还有{}关闭！".format(FormatDuration(advance)))
-        if idle_seconds >= timeout - IdleOption("countdown"):
-            RunMirrorIdleShutdown(InterFace, stop_event)
-            idle_seconds = 0
-            noticed = False
-            last_check = time.monotonic()
+        if stop_event.wait(NextIdleCheckDelay(idle_seconds, problem)):
+            break
 
 
 def Reload(server):
